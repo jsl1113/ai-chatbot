@@ -1,7 +1,7 @@
 import os 
 
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, FewShotChatMessagePromptTemplate
 # from langchain.chains import RetrievalQA
 # from langchain import hub
 from langchain_openai import ChatOpenAI
@@ -12,8 +12,11 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_community.chat_message_histories import ChatMessageHistory
+from config import answer_examples
+
 
 store = {}
+
 
 def get_session_history(session_id: str) -> BaseChatMessageHistory:
     if session_id not in store:
@@ -27,6 +30,30 @@ def get_retriever():
     database = PineconeVectorStore.from_existing_index(index_name=index_name, embedding=embedding)
     retriever = database.as_retriever(search_kwargs={'k': 7})
     return retriever
+
+
+def get_history_retriever():
+    llm = get_llm()
+    retriever = get_retriever()
+    # prompt = hub.pull("rlm/rag-prompt")
+
+    contextualize_q_system_prompt ="""
+    Given a chat history and the latest user question \
+    which might reference context in the chat history, formulate a standalone question \
+    which can be understood without the chat history. Do NOT answer the question, \
+    just reformulate it if needed and otherwise return it as is.
+    """
+    contextualize_q_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", contextualize_q_system_prompt),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
+    history_aware_retriever = create_history_aware_retriever(
+        llm, retriever, contextualize_q_prompt
+    )
+    return history_aware_retriever
 
 
 def get_llm(model='gpt-4o'):
@@ -50,41 +77,41 @@ def get_dictionary_chain():
 
 def get_rag_chain():
     llm = get_llm()
-    retriever = get_retriever()
-    # prompt = hub.pull("rlm/rag-prompt")
-
-    contextualize_q_system_prompt = """Given a chat history and the latest user question \
-    which might reference context in the chat history, formulate a standalone question \
-    which can be understood without the chat history. Do NOT answer the question, \
-    just reformulate it if needed and otherwise return it as is."""
-    contextualize_q_prompt = ChatPromptTemplate.from_messages(
+    
+    example_prompt = ChatPromptTemplate.from_messages(
         [
-            ("system", contextualize_q_system_prompt),
-            MessagesPlaceholder("chat_history"),
             ("human", "{input}"),
+            ("ai", "{answer}")
         ]
     )
-    history_aware_retriever = create_history_aware_retriever(
-        llm, retriever, contextualize_q_prompt
+
+    few_shot_prompt = FewShotChatMessagePromptTemplate(
+        example_prompt=example_prompt,
+        examples=answer_examples,
     )
-
-    qa_system_prompt = """You are an assistant for question-answering tasks. \
-    Use the following pieces of retrieved context to answer the question. \
-    If you don't know the answer, just say that you don't know. \
-    Use three sentences maximum and keep the answer concise.\
-    {context}"""
-
+    
+    qa_system_prompt ="""
+    당신은 소득세법 전문가입니다. 사용자의 소득세법에 관한 질문에 답변해주세요 \
+    아래에 제공된 문서를 활용해서 답변해주시고 \
+    답변을 알 수 없다면 모른다고 답변해주세요 \
+    답변을 제공할 때는 소득세법 (XX조)에 따르면 이라고 시작하면서 답변해주시고 \
+    2-3 문장정도의 짧은 내용의 답변을 원합니다\
+    {context}
+    """
+    
+    # 처음 채팅할 땐, history가 없다
+    # few_shot_prompt -> 그동안 채팅 방식을 착각하게 만들어서 형식 유지 
     qa_prompt = ChatPromptTemplate.from_messages(
         [
             ("system", qa_system_prompt),
+            few_shot_prompt,
             MessagesPlaceholder("chat_history"),
             ("human", "{input}"),
         ]
     )
 
-
+    history_aware_retriever = get_history_retriever()
     question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
-
     rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
 
     conversational_rag_chain = RunnableWithMessageHistory(
